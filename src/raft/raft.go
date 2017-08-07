@@ -68,6 +68,9 @@ type Raft struct {
 
 	recvHeartBeatCh   chan int
 	recvRequestVoteCh chan int
+	recvMajorVotesCh  chan int
+
+	disconnectedID map[int]int
 
 	currentTerm int
 	votedFor    int
@@ -87,7 +90,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
-	if rf.state == LEADER {
+	if rf.state == LEADER && len(rf.peers)-len(rf.disconnectedID) >= len(rf.peers)/2+1 {
 		isleader = true
 	} else {
 		isleader = false
@@ -165,6 +168,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
+	if args.Term > currentTerm {
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.mu.Unlock()
+	}
+
 	if args.Term < currentTerm {
 		reply.VoteGranted = false
 	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -176,12 +186,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Unlock()
 	} else {
 		reply.VoteGranted = false
-	}
-
-	if args.Term > currentTerm {
-		rf.mu.Lock()
-		rf.currentTerm = args.Term
-		rf.mu.Unlock()
 	}
 
 }
@@ -230,6 +234,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if reply.Term > rf.currentTerm {
 		rf.mu.Lock()
 		rf.currentTerm = reply.Term
+		rf.votedFor = -1
 		rf.state = FOLLOWER
 		rf.mu.Unlock()
 	}
@@ -253,9 +258,17 @@ type AppendEntriesReply struct {
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	fmt.Printf("leader %d send %d heartbeat\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	if !ok {
+		rf.mu.Lock()
+		rf.disconnectedID[server] = 1
+		rf.mu.Unlock()
+	}
+
 	if ok && reply.Term > rf.currentTerm {
 		rf.mu.Lock()
 		rf.state = FOLLOWER
+		rf.votedFor = -1
 		rf.mu.Unlock()
 	}
 
@@ -325,8 +338,7 @@ func randomRange(min, max int64) int64 {
 	return rand.Int63n(max-min) + min
 }
 
-func (rf *Raft) broadcastRequestVote() chan int {
-	fmt.Printf("begin broadcast req vote\n")
+func (rf *Raft) broadcastRequestVote() {
 	ok := make(chan bool)
 	for i := range rf.peers {
 		if i != rf.me {
@@ -340,7 +352,6 @@ func (rf *Raft) broadcastRequestVote() chan int {
 	}
 	done := 1
 	for i := 0; i < len(rf.peers)-1; i++ {
-		//fmt.Printf("middle of broadcast, i = %d\n", i)
 		res := <-ok
 		if res {
 			done++
@@ -349,18 +360,11 @@ func (rf *Raft) broadcastRequestVote() chan int {
 		}
 	}
 
+	fmt.Printf("%d now has %d votes, major is %d\n", rf.me, done, len(rf.peers)/2+1)
 	if rf.state == CANDIDATE && done >= (len(rf.peers)/2+1) {
-		rf.mu.Lock()
-		rf.state = LEADER
-		rf.mu.Unlock()
-		rf.sendHeartBeat()
+		rf.recvMajorVotesCh <- 1
 	}
 
-	ch := make(chan int)
-	ch <- 1
-
-	fmt.Printf("broadcast return\n")
-	return ch
 }
 
 //
@@ -388,6 +392,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.recvHeartBeatCh = make(chan int)
 	rf.recvRequestVoteCh = make(chan int)
+	rf.recvMajorVotesCh = make(chan int)
+	rf.disconnectedID = make(map[int]int)
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -395,7 +401,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go func() {
-		for k := 0; k < 10; k++ {
+		for k := 0; ; k++ {
 			fmt.Printf("id %d's %d times enter circle\n", rf.me, k)
 			switch rf.state {
 			case FOLLOWER:
@@ -418,14 +424,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.votedFor = rf.me
 				rf.mu.Unlock()
 
+				go rf.broadcastRequestVote()
 				select {
 				case <-rf.recvHeartBeatCh:
 					fmt.Printf("candidate %d recv heartbeat\n", rf.me)
 					rf.mu.Lock()
 					rf.state = FOLLOWER
 					rf.mu.Unlock()
-				case <-rf.broadcastRequestVote():
-					fmt.Printf("candidate %d finish broadcast\n", rf.me)
+				case <-rf.recvMajorVotesCh:
+					fmt.Printf("candidate %d recv major votes\n", rf.me)
+					rf.mu.Lock()
+					rf.state = LEADER
+					rf.mu.Unlock()
+				case <-time.After(time.Duration(randomRange(200, 400)) * time.Millisecond):
 				}
 			case LEADER:
 				fmt.Printf("now %d is Leader\n", rf.me)
